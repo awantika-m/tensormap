@@ -45,15 +45,16 @@ export function subscribeToJob(jobId, onEvent) {
   const s = getTrainingSocket();
 
   const handler = (data) => {
-    if (!data || data.version !== SUPPORTED_TRAINING_EVENT_VERSION) {
+    if (!data) return;
+
+    const isTrainingEvent = ["metrics", "catchup", "status"].includes(data.type);
+    if (isTrainingEvent && data.version !== SUPPORTED_TRAINING_EVENT_VERSION) {
+      // Ignore unsupported versions of our structured protocol safely.
       return;
     }
 
-    if (
-      data.type === "metrics" ||
-      data.type === "catchup" ||
-      data.type === "status"
-    ) {
+    if (isTrainingEvent || typeof data === "object") {
+      // This listener also carries legacy model progress payloads (message/test).
       onEvent(data);
     }
   };

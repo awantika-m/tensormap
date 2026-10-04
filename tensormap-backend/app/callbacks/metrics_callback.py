@@ -71,6 +71,15 @@ class MetricsCallback(tf.keras.callbacks.Callback):
         self.start_time = None
         self.current_batch = 0
         self.current_steps = 0
+        self.validation_batch = 0
+        self.validation_steps = 0
+
+    def on_epoch_begin(self, epoch: int, logs: dict = None) -> None:
+        """Reset per-epoch counters before training batches begin."""
+        self.current_batch = 0
+        self.current_steps = 0
+        self.validation_batch = 0
+        self.validation_steps = 0
 
     def on_train_begin(self, logs: dict = None) -> None:
         """Mark the job RUNNING and record the start time."""
@@ -89,8 +98,9 @@ class MetricsCallback(tf.keras.callbacks.Callback):
         self.current_steps += 1
 
     def on_test_batch_end(self, batch: int, logs: dict = None) -> None:
-        """Track the current validation batch."""
-        self.current_batch = batch + 1
+        """Track validation batches independently of training progress."""
+        self.validation_batch = batch + 1
+        self.validation_steps += 1
 
     def on_epoch_end(self, epoch: int, logs: dict = None) -> None:
         """Persist this epoch's metrics and emit them to the job's room."""
@@ -131,26 +141,11 @@ class MetricsCallback(tf.keras.callbacks.Callback):
                 phase="train",
                 batch=self.current_batch,
                 steps=self.current_steps,
+                validation_batch=self.validation_batch,
+                validation_steps=self.validation_steps,
                 **payload,
             )
         )
-
-        # Emit validation metrics separately when available.
-        if payload["val_loss"] is not None or payload["val_accuracy"] is not None:
-            self._emit(
-                _event_envelope(
-                    self.job_id,
-                    "metrics",
-                    phase="validation",
-                    batch=self.current_batch,
-                    steps=self.current_steps,
-                    epoch=payload["epoch"],
-                    loss=None,
-                    accuracy=None,
-                    val_loss=payload["val_loss"],
-                    val_accuracy=payload["val_accuracy"],
-                )
-            )
 
     def on_train_end(self, logs: dict = None) -> None:
         """Mark the job COMPLETED — unless it was cancelled/failed meanwhile."""
