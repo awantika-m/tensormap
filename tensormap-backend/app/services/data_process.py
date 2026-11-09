@@ -1,4 +1,5 @@
 import contextlib
+import csv
 import json
 import os
 import shutil
@@ -41,6 +42,17 @@ def _get_file_path(file: DataFile) -> str:
     return f"{settings.upload_folder}/{file.disk_name}"
 
 
+def _require_csv_file(file: DataFile, operation: str = "tabular data processing") -> tuple | None:
+    """Validate that the file has a 'csv' file_type for tabular operations."""
+    if file.file_type != "csv":
+        return _resp(
+            400,
+            False,
+            f"Only CSV files support {operation}, but file '{file.file_name}' has type '{file.file_type}'",
+        )
+    return None
+
+
 def add_target_service(db: Session, file_id: uuid_pkg.UUID, target: str) -> tuple:
     """Create or update the target field assignment for a file.
 
@@ -51,8 +63,9 @@ def add_target_service(db: Session, file_id: uuid_pkg.UUID, target: str) -> tupl
         file = db.exec(select(DataFile).where(DataFile.id == file_id)).first()
         if not file:
             return _resp(400, False, "File doesn't exist in DB")
-        if file.file_type != "csv":
-            return _resp(400, False, "Only CSV files support target field assignment")
+        csv_err = _require_csv_file(file, "target field assignment")
+        if csv_err:
+            return csv_err
         if file.columns is not None and target not in file.columns:
             return _resp(
                 400,
@@ -139,7 +152,7 @@ def get_one_target_by_id_service(db: Session, file_id: uuid_pkg.UUID) -> tuple:
         "file_type": file.file_type,
         "target_field": target_record.target,
     }
-    return _resp(200, True, "Target fields of all files received successfully", data)
+    return _resp(200, True, "Target field received successfully", data)
 
 
 def get_data_metrics(db: Session, file_id: uuid_pkg.UUID) -> tuple:
@@ -147,6 +160,10 @@ def get_data_metrics(db: Session, file_id: uuid_pkg.UUID) -> tuple:
     file = db.exec(select(DataFile).where(DataFile.id == file_id)).first()
     if not file:
         return _resp(400, False, "File doesn't exist in DB")
+
+    csv_err = _require_csv_file(file, "computing dataset metrics")
+    if csv_err:
+        return csv_err
 
     file_path = _get_file_path(file)
     try:
@@ -160,10 +177,15 @@ def get_data_metrics(db: Session, file_id: uuid_pkg.UUID) -> tuple:
         logger.exception("Error reading file: %s", str(e))
         return _resp(500, False, f"Error reading CSV: {e}")
 
+    def _clean_str_dict(df_in: pd.DataFrame) -> dict:
+        return {
+            col: {k: None if pd.isna(v) else str(v) for k, v in row.items()} for col, row in df_in.to_dict().items()
+        }
+
     metrics = {
         "data_types": df.dtypes.apply(str).to_dict(),
-        "correlation_matrix": df.corr(numeric_only=True).map(str).to_dict(),
-        "metric": df.describe().map(str).to_dict(),
+        "correlation_matrix": _clean_str_dict(df.corr(numeric_only=True)),
+        "metric": _clean_str_dict(df.describe()),
     }
     return _resp(200, True, "Dataset metrics generated successfully", metrics)
 
@@ -173,6 +195,10 @@ def get_column_stats_service(db: Session, file_id: uuid_pkg.UUID) -> tuple:
     file = db.exec(select(DataFile).where(DataFile.id == file_id)).first()
     if not file:
         return _resp(400, False, "File doesn't exist in DB")
+
+    csv_err = _require_csv_file(file, "computing column statistics")
+    if csv_err:
+        return csv_err
 
     file_path = _get_file_path(file)
     try:
@@ -227,6 +253,10 @@ def get_correlation_matrix(db: Session, file_id: uuid_pkg.UUID) -> tuple:
     if not file:
         return _resp(400, False, "File doesn't exist in DB")
 
+    csv_err = _require_csv_file(file, "computing correlation matrix")
+    if csv_err:
+        return csv_err
+
     file_path = _get_file_path(file)
     try:
         df = pd.read_csv(file_path)
@@ -261,11 +291,16 @@ def get_file_data(db: Session, file_id: uuid_pkg.UUID, page: int = 1, page_size:
     if not file:
         return _resp(400, False, "Unable to open file")
 
+    csv_err = _require_csv_file(file, "tabular data preview")
+    if csv_err:
+        return csv_err
+
     file_path = _get_file_path(file)
 
     try:
-        with open(file_path, "rb") as f:
-            total_rows = sum(1 for _ in f) - 1
+        # Count CSV records, not lines: a quoted value can span several lines, and pandas skips blank lines.
+        with open(file_path, newline="", encoding="utf-8", errors="replace") as f:
+            total_rows = sum(1 for row in csv.reader(f) if row) - 1
         total_rows = max(total_rows, 0)
     except FileNotFoundError:
         return _resp(500, False, f"File not found: {file_path}")
@@ -382,6 +417,10 @@ def preprocess_data(db: Session, file_id: uuid_pkg.UUID, transformations: list) 
     if not file:
         return _resp(400, False, "File doesn't exist in DB")
 
+    csv_err = _require_csv_file(file, "dataset preprocessing")
+    if csv_err:
+        return csv_err
+
     file_path = _get_file_path(file)
 
     try:
@@ -453,3 +492,72 @@ def preprocess_data(db: Session, file_id: uuid_pkg.UUID, transformations: list) 
     except Exception as e:
         logger.exception("Error preprocessing data: %s", str(e))
         return _resp(500, False, f"Error preprocessing data: {e}")
+
+
+def revert_data_process_service(db: Session, file_id: uuid_pkg.UUID) -> tuple:
+    """Revert a CSV dataset to its pre-processed state using the backup file (.bak).
+
+    Atomically restores the original CSV from file_path + ".bak", removes the backup,
+    refreshes the cached columns in DataFile.columns, and commits the updated record.
+    """
+    file = db.exec(select(DataFile).where(DataFile.id == file_id)).first()
+    if not file:
+        return _resp(400, False, "File doesn't exist in DB")
+
+    if file.file_type != "csv":
+        return _resp(400, False, "Revert is only supported for CSV datasets")
+
+    file_path = _get_file_path(file)
+    bak_path = file_path + ".bak"
+
+    if not os.path.isfile(bak_path):
+        return _resp(400, False, "No preprocessing backup found for this dataset")
+
+    # Atomically replace current transformed file with the backup
+    try:
+        os.replace(bak_path, file_path)
+    except OSError as e:
+        logger.exception("Failed to restore backup from %s to %s", bak_path, file_path)
+        return _resp(500, False, f"Failed to restore dataset from backup: {e}")
+
+    # Refresh columns cache
+    refreshed_columns = read_csv_columns(file_path)
+    if refreshed_columns is not None:
+        file.columns = refreshed_columns
+        db.add(file)
+        db.commit()
+
+    return _resp(
+        200,
+        True,
+        "Dataset reverted to pre-processed state successfully",
+        {"file_id": str(file_id), "columns": file.columns},
+    )
+
+
+def get_dataset_backup_status_service(db: Session, file_id: uuid_pkg.UUID) -> tuple:
+    """Check if a preprocessing backup exists for a CSV file and return its metadata."""
+    file = db.exec(select(DataFile).where(DataFile.id == file_id)).first()
+    if not file:
+        return _resp(400, False, "File doesn't exist in DB")
+
+    if file.file_type != "csv":
+        return _resp(
+            200,
+            True,
+            "Backup status retrieved successfully",
+            {"has_backup": False, "backup_size_bytes": None},
+        )
+
+    file_path = _get_file_path(file)
+    bak_path = file_path + ".bak"
+
+    has_backup = os.path.isfile(bak_path)
+    backup_size = os.path.getsize(bak_path) if has_backup else None
+
+    return _resp(
+        200,
+        True,
+        "Backup status retrieved successfully",
+        {"has_backup": has_backup, "backup_size_bytes": backup_size},
+    )

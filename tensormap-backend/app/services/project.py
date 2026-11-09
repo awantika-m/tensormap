@@ -127,7 +127,7 @@ def update_project_service(db: Session, project_id: uuid_pkg.UUID, data: Project
         update_data = data.model_dump(exclude_unset=True)
         for key, value in update_data.items():
             setattr(project, key, value)
-        project.updated_on = datetime.utcnow()
+        project.updated_on = datetime.now(UTC)
 
         db.add(project)
         db.commit()
@@ -166,6 +166,16 @@ def delete_project_service(db: Session, project_id: uuid_pkg.UUID) -> tuple:
         data_files = db.exec(select(DataFile).where(DataFile.project_id == project_id)).all()
         models = db.exec(select(ModelBasic).where(ModelBasic.project_id == project_id)).all()
 
+        # Clean up exported model directories before the DB cascade removes the TrainingJob records
+        for model in models:
+            if model.id is not None:
+                try:
+                    from app.services.model_export import delete_model_exports
+
+                    delete_model_exports(model.id, db)
+                except Exception as e:
+                    logger.warning("Failed to clean up exports for model %s: %s", model.id, e)
+
         db.delete(project)
         db.commit()
     except SQLAlchemyError:
@@ -188,6 +198,11 @@ def delete_project_service(db: Session, project_id: uuid_pkg.UUID) -> tuple:
             os.remove(file_path)
             # Only files that were actually present and removed are counted.
             n_files += 1
+
+        bak_path = file_path + ".bak"
+        if os.path.isfile(bak_path):
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(bak_path)
 
         if file.file_type == "zip" and "." in file.disk_name:
             # The extraction directory is derived from the ZIP's disk_name by

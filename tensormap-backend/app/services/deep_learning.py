@@ -3,7 +3,6 @@ import copy
 import json
 import os
 import re
-import sys
 import uuid as uuid_pkg
 from collections import defaultdict, deque
 from datetime import UTC
@@ -35,7 +34,14 @@ from app.shared.constants import (
     MODEL_TRAINING_SPLIT,
     PROBLEM_TYPE,
 )
-from app.shared.enums import ProblemType
+from app.shared.enums import (
+    CLASSIFICATION_LOSSES,
+    LossFunction,
+    Metric,
+    Optimizer,
+    ProblemType,
+    losses_for_problem_type,
+)
 from app.shared.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -45,6 +51,13 @@ tf = None
 def _resp(status_code: int, success: bool, message: str, data: Any = None) -> tuple:
     """Build a standard API response tuple of (body_dict, status_code)."""
     return {"success": success, "message": message, "data": data}, status_code
+
+
+def _default_loss(problem_type_id: int) -> str:
+    """Loss used when a training config does not name one (and for models saved before the field existed)."""
+    if problem_type_id in (ProblemType.CLASSIFICATION, ProblemType.IMAGE_CLASSIFICATION):
+        return LossFunction.SPARSE_CATEGORICAL_CROSSENTROPY.value
+    return LossFunction.MEAN_SQUARED_ERROR.value
 
 
 def _sanitize_model_name(name: str) -> str:
@@ -80,14 +93,12 @@ def _blocking_ir_errors(graph_ir) -> list[str]:
 
     Structural errors (cycles, edges to unknown nodes, invalid merge arity,
     missing input) are surfaced early with clear messages instead of being
-    deferred to opaque Keras failures. Multi-input models are a supported
-    feature (both generators handle them), so the "multiple input nodes"
-    check is intentionally excluded.
+    deferred to opaque Keras failures.
     """
     from app.ir.schema import validate_ir_graph
 
     errors = validate_ir_graph(graph_ir)
-    return [e.message for e in errors if e.code != "multiple_input_nodes"]
+    return [e.message for e in errors]
 
 
 def _validate_graph_size(graph: dict | None) -> str | None:
@@ -95,7 +106,7 @@ def _validate_graph_size(graph: dict | None) -> str | None:
     if graph is None:
         return None
     raw = json.dumps(graph)
-    size = sys.getsizeof(raw)
+    size = len(raw.encode("utf-8"))
     if size > _MAX_GRAPH_JSON_BYTES:
         return f"Graph payload too large ({size} bytes > {_MAX_GRAPH_JSON_BYTES})"
     return None
@@ -216,11 +227,6 @@ def model_validate_service(db: Session, incoming: dict, project_id: uuid_pkg.UUI
     if existing:
         return _resp(400, False, "Model name already used. Use a different name")
 
-    if code[PROBLEM_TYPE] in (ProblemType.CLASSIFICATION, ProblemType.IMAGE_CLASSIFICATION):
-        loss = "sparse_categorical_crossentropy"
-    else:
-        loss = "mean_squared_error"
-
     model = ModelBasic(
         model_name=code[DL_MODEL][MODEL_NAME],
         file_id=code[DATASET][FILE_ID],
@@ -231,7 +237,7 @@ def model_validate_service(db: Session, incoming: dict, project_id: uuid_pkg.UUI
         optimizer=code[DL_MODEL][MODEL_OPTIMIZER],
         metric=code[DL_MODEL][MODEL_METRIC],
         epochs=code[DL_MODEL][MODEL_EPOCHS],
-        loss=loss,
+        loss=_default_loss(code[PROBLEM_TYPE]),
         graph_json=_extract_graph(incoming),
         graph_ir=graph_ir_data,  # NEW: Dual-write to graph_ir
     )
@@ -250,6 +256,8 @@ def model_validate_service(db: Session, incoming: dict, project_id: uuid_pkg.UUI
     # If file write fails, DB is never touched. If DB fails, file is cleaned up.
     model_path = _validate_model_path(code[DL_MODEL][MODEL_NAME])  # Issue #1
     try:
+        # Ensure the directory exists before writing
+        os.makedirs(os.path.dirname(model_path), exist_ok=True)
         with open(model_path, "w+") as f:
             f.write(json.dumps(model_generated) + "\n")
         logger.info("Model JSON written to %s", model_path)
@@ -429,10 +437,30 @@ def update_training_config_service(
         return _resp(404, False, "Model not found")
 
     problem_type_id = config["problem_type_id"]
-    if problem_type_id in (ProblemType.CLASSIFICATION, ProblemType.IMAGE_CLASSIFICATION):
-        loss = "sparse_categorical_crossentropy"
-    else:
-        loss = "mean_squared_error"
+    loss = config.get("loss") or _default_loss(problem_type_id)
+    try:
+        Optimizer(config["optimizer"])
+    except ValueError:
+        valid_opts = ", ".join(sorted(o.value for o in Optimizer))
+        return _resp(400, False, f"Optimizer {config['optimizer']!r} is not supported. Choose one of: {valid_opts}.")
+
+    try:
+        Metric(config["metric"])
+    except ValueError:
+        valid_metrics = ", ".join(sorted(m.value for m in Metric))
+        return _resp(400, False, f"Metric {config['metric']!r} is not supported. Choose one of: {valid_metrics}.")
+
+    try:
+        loss_enum = LossFunction(loss)
+    except ValueError:
+        valid_losses = ", ".join(sorted(fn.value for fn in LossFunction))
+        return _resp(400, False, f"Loss {loss!r} is not supported. Choose one of: {valid_losses}.")
+
+    if loss_enum not in losses_for_problem_type(problem_type_id):
+        # A mismatch only fails (or trains to nonsense) at run time, so refuse it here.
+        kind = "classification" if losses_for_problem_type(problem_type_id) is CLASSIFICATION_LOSSES else "regression"
+        allowed = ", ".join(sorted(x.value for x in losses_for_problem_type(problem_type_id)))
+        return _resp(400, False, f"Loss {loss!r} cannot be used for {kind}. Choose one of: {allowed}.")
 
     model.file_id = config["file_id"]
     model.model_type = problem_type_id
@@ -442,7 +470,7 @@ def update_training_config_service(
     model.metric = config["metric"]
     model.epochs = config["epochs"]
     model.batch_size = config.get("batch_size", 32)
-    model.loss = loss
+    model.loss = loss_enum.value
 
     try:
         db.add(model)
@@ -546,20 +574,27 @@ def _apply_auto_layout(graph: dict) -> None:
     lightweight layered layout derived from edge directions so ReactFlow can
     render meaningful structure even for legacy graphs without saved positions.
     """
-    nodes = graph.get("nodes", [])
-    if not nodes:
+    if not isinstance(graph, dict):
         return
 
-    by_id = {str(node.get("id")): node for node in nodes if node.get("id") is not None}
+    nodes = graph.get("nodes", [])
+    if not nodes or not isinstance(nodes, list):
+        return
+
+    by_id = {str(node["id"]): node for node in nodes if isinstance(node, dict) and node.get("id") is not None}
     adjacency: dict[str, set[str]] = defaultdict(set)
     indegree: dict[str, int] = {node_id: 0 for node_id in by_id}
 
-    for edge in graph.get("edges", []):
-        source = str(edge.get("source")) if edge.get("source") is not None else None
-        target = str(edge.get("target")) if edge.get("target") is not None else None
-        if source in by_id and target in by_id and target not in adjacency[source]:
-            adjacency[source].add(target)
-            indegree[target] += 1
+    edges = graph.get("edges", [])
+    if isinstance(edges, list):
+        for edge in edges:
+            if not isinstance(edge, dict):
+                continue
+            source = str(edge.get("source")) if edge.get("source") is not None else None
+            target = str(edge.get("target")) if edge.get("target") is not None else None
+            if source in by_id and target in by_id and target not in adjacency[source]:
+                adjacency[source].add(target)
+                indegree[target] += 1
 
     queue = deque(sorted(node_id for node_id, degree in indegree.items() if degree == 0))
     layer: dict[str, int] = {node_id: 0 for node_id in queue}
@@ -616,17 +651,18 @@ def _unflatten_model_configs(configs: list[ModelConfigs]) -> dict:
     result = _numeric_dicts_to_lists(root)
 
     # Extract graph portion — configs from model_validate_service nest under "model"
-    if "nodes" not in result and "model" in result and isinstance(result["model"], dict):
+    if isinstance(result, dict) and "nodes" not in result and isinstance(result.get("model"), dict):
         result = result["model"]
 
     # Coerce position x/y to numbers for ReactFlow
-    for node in result.get("nodes", []):
-        if "position" in node and isinstance(node["position"], dict):
-            for axis in ("x", "y"):
-                val = node["position"].get(axis)
-                if isinstance(val, str):
-                    with contextlib.suppress(ValueError, AttributeError):
-                        node["position"][axis] = int(val) if val.lstrip("-").isdigit() else float(val)
+    if isinstance(result, dict) and isinstance(result.get("nodes"), list):
+        for node in result["nodes"]:
+            if isinstance(node, dict) and isinstance(node.get("position"), dict):
+                for axis in ("x", "y"):
+                    val = node["position"].get(axis)
+                    if isinstance(val, str):
+                        with contextlib.suppress(ValueError, AttributeError):
+                            node["position"][axis] = int(val) if val.lstrip("-").isdigit() else float(val)
 
     return result
 
@@ -731,69 +767,18 @@ def get_model_architecture_service(db: Session, model_id: int, include_stats: bo
 
 
 def _estimate_param_count(graph_ir: dict) -> int:
-    """Estimate parameter count from graph IR.
+    """Count a stored graph's parameters with the static analyzer, without building it in Keras.
 
-    This is a rough estimation based on layer types and configurations.
-    For accurate counts, the model would need to be built and model.count_params() called.
+    Raises:
+        ValueError: If the graph cannot be analysed, so the count would be wrong.
     """
-    param_count = 0
-    nodes = graph_ir.get("nodes", [])
+    from app.ir.analysis import analyze_graph
+    from app.ir.schema import IRGraph
 
-    # Track previous layer output shape for Dense layers
-    prev_shape = None
-
-    for node in nodes:
-        node_params = node.get("node_params", {})
-        layer_type = node_params.get("layer_type", "").lower()
-
-        if layer_type == "input":
-            shape = node_params.get("shape", [])
-            if isinstance(shape, list) and len(shape) > 0:
-                # For input, store the last dimension
-                prev_shape = shape[-1] if shape[-1] is not None else 128  # default guess
-            elif isinstance(shape, int):
-                prev_shape = shape
-
-        elif layer_type == "dense":
-            units = node_params.get("units", 0)
-            if prev_shape is not None:
-                # weights: (prev_shape, units) + bias: (units,)
-                param_count += (prev_shape * units) + units
-            prev_shape = units
-
-        elif layer_type == "conv2d":
-            filters = node_params.get("filters", 0)
-            kernel_size = node_params.get("kernel_size", [3, 3])
-            if isinstance(kernel_size, int):
-                kernel_size = [kernel_size, kernel_size]
-            # Rough estimate: kernel_h * kernel_w * input_channels * filters + bias
-            # Assume 3 input channels for simplicity (or use prev_shape if known)
-            input_channels = 3 if prev_shape is None else prev_shape
-            param_count += (kernel_size[0] * kernel_size[1] * input_channels * filters) + filters
-            prev_shape = filters
-
-        elif layer_type == "lstm":
-            units = node_params.get("units", 0)
-            # LSTM has 4 gates, each with weights and recurrent weights
-            # Rough estimate: 4 * (input_dim * units + units * units + units)
-            input_dim = prev_shape if prev_shape is not None else 128
-            param_count += 4 * (input_dim * units + units * units + units)
-            prev_shape = units
-
-        elif layer_type == "gru":
-            units = node_params.get("units", 0)
-            # GRU has 3 gates
-            input_dim = prev_shape if prev_shape is not None else 128
-            param_count += 3 * (input_dim * units + units * units + units)
-            prev_shape = units
-
-        elif layer_type == "embedding":
-            input_dim = node_params.get("input_dim", 0)
-            output_dim = node_params.get("output_dim", 0)
-            param_count += input_dim * output_dim
-            prev_shape = output_dim
-
-    return param_count
+    analysis = analyze_graph(IRGraph(**graph_ir))
+    if not analysis.complete:
+        raise ValueError("; ".join(d.message for d in analysis.errors()) or "graph could not be analysed")
+    return analysis.total_params
 
 
 def get_training_history_service(

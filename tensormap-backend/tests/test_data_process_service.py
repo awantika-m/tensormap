@@ -301,6 +301,19 @@ class TestGetAllTargetsService:
 
 
 class TestGetDataMetrics:
+    def test_rejects_non_csv_file(self, mock_db, file_id):
+        zip_file = MagicMock(spec=DataFile)
+        zip_file.id = file_id
+        zip_file.file_name = "dataset.zip"
+        zip_file.file_type = "zip"
+        mock_db.exec.return_value.first.return_value = zip_file
+
+        body, status = get_data_metrics(mock_db, file_id)
+
+        assert status == 400
+        assert body["success"] is False
+        assert "CSV" in body["message"]
+
     @patch("app.services.data_process.get_settings")
     def test_classification_csv(self, mock_settings, mock_db, file_id, sample_file, classification_csv):
         mock_settings.return_value.upload_folder = str(classification_csv)
@@ -369,6 +382,27 @@ class TestGetDataMetrics:
         assert status == 200
         assert body["data"]["metric"]["a"]["count"] == "0"
 
+    @patch("app.services.data_process.get_settings")
+    def test_nan_correlation_serializes_to_none(self, mock_settings, mock_db, file_id, tmp_path):
+        """Constant column produces NaN in correlation matrix, which must serialize to None (null)."""
+        # Column 'const' has variance 0, so corr produces NaN
+        pd.DataFrame({"const": [5, 5, 5], "val": [1, 2, 3]}).to_csv(tmp_path / "const.csv", index=False)
+
+        const_file = MagicMock(spec=DataFile)
+        const_file.file_name = "const"
+        const_file.file_type = "csv"
+        const_file.disk_name = "const.csv"
+
+        mock_settings.return_value.upload_folder = str(tmp_path)
+        mock_db.exec.return_value.first.return_value = const_file
+
+        body, status = get_data_metrics(mock_db, file_id)
+
+        assert status == 200
+        corr_matrix = body["data"]["correlation_matrix"]
+        assert corr_matrix["const"]["val"] is None, "NaN correlation should serialize to None/null"
+        assert corr_matrix["val"]["const"] is None, "NaN correlation should serialize to None/null"
+
 
 # ---------------------------------------------------------------------------
 # get_file_data
@@ -376,6 +410,19 @@ class TestGetDataMetrics:
 
 
 class TestGetFileData:
+    def test_rejects_non_csv_file(self, mock_db, file_id):
+        zip_file = MagicMock(spec=DataFile)
+        zip_file.id = file_id
+        zip_file.file_name = "dataset.zip"
+        zip_file.file_type = "zip"
+        mock_db.exec.return_value.first.return_value = zip_file
+
+        body, status = get_file_data(mock_db, file_id)
+
+        assert status == 400
+        assert body["success"] is False
+        assert "CSV" in body["message"]
+
     @patch("app.services.data_process.get_settings")
     def test_get_file_data_page1(self, mock_settings, mock_db, file_id, sample_file, classification_csv):
         mock_settings.return_value.upload_folder = str(classification_csv)
@@ -433,6 +480,36 @@ class TestGetFileData:
         assert body["pagination"]["total_pages"] == 0
         assert len(body["data"]) == 0
 
+    @pytest.mark.parametrize(
+        ("content", "expected_rows"),
+        [
+            ('a,b\n1,"line one\nline two"\n2,x\n3,y\n4,z\n', 4),
+            ("a,b\n1,x\n2,y\n\n\n", 2),
+        ],
+        ids=["quoted_line_break", "trailing_blank_lines"],
+    )
+    @patch("app.services.data_process.get_settings")
+    def test_get_file_data_counts_records_not_lines(
+        self, mock_settings, mock_db, file_id, tmp_path, content, expected_rows
+    ):
+        (tmp_path / "rows.csv").write_text(content)
+
+        rows_file = MagicMock(spec=DataFile)
+        rows_file.file_name = "rows"
+        rows_file.file_type = "csv"
+        rows_file.disk_name = "rows.csv"
+        rows_file.row_count = None
+
+        mock_settings.return_value.upload_folder = str(tmp_path)
+        mock_db.exec.return_value.first.return_value = rows_file
+
+        body, status = get_file_data(mock_db, file_id, page=1, page_size=2)
+
+        assert status == 200
+        assert body["pagination"]["total_rows"] == expected_rows
+        assert body["pagination"]["total_pages"] == (expected_rows + 1) // 2
+        assert len(body["data"]) == 2
+
     def test_file_not_in_db(self, mock_db, file_id):
         mock_db.exec.return_value.first.return_value = None
 
@@ -458,6 +535,19 @@ class TestGetFileData:
 
 
 class TestPreprocessData:
+    def test_rejects_non_csv_file(self, mock_db, file_id):
+        zip_file = MagicMock(spec=DataFile)
+        zip_file.id = file_id
+        zip_file.file_name = "dataset.zip"
+        zip_file.file_type = "zip"
+        mock_db.exec.return_value.first.return_value = zip_file
+
+        body, status = preprocess_data(mock_db, file_id, [])
+
+        assert status == 400
+        assert body["success"] is False
+        assert "CSV" in body["message"]
+
     @patch("app.services.data_process.get_settings")
     def test_drop_column(self, mock_settings, mock_db, file_id, sample_file, classification_csv):
         mock_settings.return_value.upload_folder = str(classification_csv)

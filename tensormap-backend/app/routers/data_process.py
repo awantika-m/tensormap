@@ -16,15 +16,37 @@ from app.services.data_process import (
     get_column_stats_service,
     get_correlation_matrix,
     get_data_metrics,
+    get_dataset_backup_status_service,
     get_file_data,
     get_one_target_by_id_service,
     preprocess_data,
+    revert_data_process_service,
 )
+from app.services.dataset_quality import analyze_dataset_quality
 from app.shared.logging_config import get_logger
 
 logger = get_logger(__name__)
 
 router = APIRouter(tags=["data-process"])
+
+
+@router.get("/data/process/quality/{file_id}")
+def get_dataset_quality(
+    file_id: uuid_pkg.UUID,
+    target_field: str | None = Query(None),
+    problem_type_id: int | None = Query(None, ge=1, le=3),
+    training_split: float | None = Query(None),
+    db: Session = Depends(get_db),
+):
+    """Return a read-only quality report for a dataset and its selected target."""
+    body, status_code = analyze_dataset_quality(
+        db,
+        file_id=file_id,
+        target_field=target_field,
+        problem_type_id=problem_type_id,
+        training_split=training_split,
+    )
+    return JSONResponse(status_code=status_code, content=body)
 
 
 @router.post("/data/process/target")
@@ -99,4 +121,19 @@ def preprocess(file_id: uuid_pkg.UUID, request: PreprocessRequest, db: Session =
     """Apply transformations to a CSV file, overwriting it in place."""
     logger.debug("Preprocessing file_id=%s with %d transformations", file_id, len(request.transformations))
     body, status_code = preprocess_data(db, file_id=file_id, transformations=request.transformations)
+    return JSONResponse(status_code=status_code, content=body)
+
+
+@router.post("/data/process/revert/{file_id}")
+def revert_preprocess(file_id: uuid_pkg.UUID, db: Session = Depends(get_db)):
+    """Revert a CSV file to its pre-processed state using the backup file."""
+    logger.debug("Reverting preprocessing for file_id=%s", file_id)
+    body, status_code = revert_data_process_service(db, file_id=file_id)
+    return JSONResponse(status_code=status_code, content=body)
+
+
+@router.get("/data/process/backup/{file_id}")
+def get_backup_status(file_id: uuid_pkg.UUID, db: Session = Depends(get_db)):
+    """Check if a preprocessing backup exists for a CSV file and return its details."""
+    body, status_code = get_dataset_backup_status_service(db, file_id=file_id)
     return JSONResponse(status_code=status_code, content=body)

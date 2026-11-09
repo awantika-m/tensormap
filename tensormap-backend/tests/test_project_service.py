@@ -183,6 +183,48 @@ class TestDeleteProjectService:
         assert status == 200
         assert not extract_dir.exists()
 
+    def test_delete_project_cascades_model_exports(self, mock_db, project_id, sample_project, tmp_path):
+        mock_db.get.return_value = sample_project
+        m1 = MagicMock(spec=ModelBasic)
+        m1.id = 101
+        m1.model_name = "model1"
+        mock_db.exec.return_value.all.side_effect = [
+            [],  # data_files
+            [m1],  # models
+        ]
+
+        with (
+            patch("app.services.project.get_settings") as mock_settings,
+            patch("app.services.model_export.delete_model_exports") as mock_delete_exports,
+        ):
+            mock_settings.return_value.upload_folder = str(tmp_path)
+            body, status = delete_project_service(mock_db, project_id)
+
+        assert status == 200
+        assert body["success"] is True
+        mock_delete_exports.assert_called_once_with(101, mock_db)
+
+    def test_delete_project_continues_if_export_cleanup_fails(self, mock_db, project_id, sample_project, tmp_path):
+        mock_db.get.return_value = sample_project
+        m1 = MagicMock(spec=ModelBasic)
+        m1.id = 102
+        m1.model_name = "model2"
+        mock_db.exec.return_value.all.side_effect = [
+            [],
+            [m1],
+        ]
+
+        with (
+            patch("app.services.project.get_settings") as mock_settings,
+            patch("app.services.model_export.delete_model_exports", side_effect=Exception("Disk error")),
+        ):
+            mock_settings.return_value.upload_folder = str(tmp_path)
+            body, status = delete_project_service(mock_db, project_id)
+
+        assert status == 200
+        assert body["success"] is True
+        mock_db.delete.assert_called_once_with(sample_project)
+
 
 class TestCreateProjectService:
     def _make_project(self, name="Test", description="Desc"):
@@ -381,3 +423,20 @@ class TestUpdateProjectService:
 
         assert project.name == "New Name"
         assert project.description == "Keep This"
+
+    def test_updated_on_is_timezone_aware_utc(self, mock_db, project_id):
+        """Regression test: updated_on must be a timezone-aware UTC datetime.
+
+        Previously ``datetime.utcnow()`` produced a naive datetime object,
+        causing DeprecationWarning in Python 3.12 and incorrect ISO-8601
+        serialisation downstream.  The fix uses ``datetime.now(UTC)`` which
+        always carries tzinfo=UTC.
+        """
+        project = self._make_project()
+        mock_db.get.return_value = project
+        mock_db.refresh.side_effect = lambda p: None
+
+        update_project_service(mock_db, project_id, ProjectUpdateRequest(name="TZ Test"))
+
+        assert project.updated_on.tzinfo is not None, "updated_on must be timezone-aware"
+        assert project.updated_on.tzinfo == UTC, "updated_on must use UTC"

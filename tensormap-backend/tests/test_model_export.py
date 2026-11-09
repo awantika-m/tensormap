@@ -1,12 +1,17 @@
 """Tests for model export service (SavedModel, TFLite, ONNX)."""
 
+import contextlib
 import importlib.util
+import shutil
+import threading
 import zipfile
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from unittest.mock import Mock, patch
 from uuid import uuid4
 
 import pytest
+from fastapi.testclient import TestClient
 from sqlmodel import Session
 
 from app.models.ml import ModelBasic
@@ -40,6 +45,12 @@ def mock_keras_model():
     mock_model = Mock()
     mock_model.input_shape = (None, 28, 28, 1)
     mock_model.save = Mock()
+
+    def fake_export(path):
+        Path(path).mkdir(parents=True)
+        (Path(path) / "saved_model.pb").write_text("dummy pb")
+
+    mock_model.export.side_effect = fake_export
     return mock_model
 
 
@@ -77,21 +88,20 @@ def test_savedmodel_export_uses_model_export(tmp_path, mock_keras_model):
         patch("tensorflow.keras.models.load_model", return_value=mock_keras_model),
         patch("tensorflow.keras.models.save_model") as mock_save_model,
     ):
-        # Create savedmodel directory for zipping
-        savedmodel_dir = export_dir / "savedmodel"
-        savedmodel_dir.mkdir()
-        (savedmodel_dir / "saved_model.pb").write_text("dummy pb")
-
         zip_path = export_savedmodel(job_id, model_name)
 
         # The Keras-2 call with save_format="tf" must not come back.
         mock_save_model.assert_not_called()
         assert mock_keras_model.export.call_count == 1
-        assert mock_keras_model.export.call_args[0][0] == str(savedmodel_dir)
+        savedmodel_dir = Path(mock_keras_model.export.call_args[0][0])
+        assert savedmodel_dir.name == "savedmodel"
+        assert savedmodel_dir.is_relative_to(export_dir)
 
         assert zip_path.exists()
         assert zip_path.suffix == ".zip"
         assert model_name in zip_path.name
+        with zipfile.ZipFile(zip_path) as archive:
+            assert "savedmodel/saved_model.pb" in {n.replace("\\", "/") for n in archive.namelist()}
 
 
 @pytest.mark.slow
@@ -155,9 +165,12 @@ def test_tflite_export_uses_savedmodel_path(tmp_path, mock_keras_model):
 
         # The Keras-3-incompatible entry point must not come back.
         mock_from_keras.assert_not_called()
-        # The model is exported to the job's savedmodel directory first.
-        mock_keras_model.export.assert_called_once_with(str(export_dir / "savedmodel"))
-        mock_from_saved.assert_called_once_with(str(export_dir / "savedmodel"))
+        # The model is exported to a SavedModel inside the job's directory first,
+        # and the converter reads that same SavedModel.
+        mock_keras_model.export.assert_called_once()
+        savedmodel_dir = mock_keras_model.export.call_args[0][0]
+        assert Path(savedmodel_dir).is_relative_to(export_dir)
+        mock_from_saved.assert_called_once_with(savedmodel_dir)
 
         assert tflite_path.exists()
         assert tflite_path.suffix == ".tflite"
@@ -451,6 +464,106 @@ def test_onnx_export_succeeds_with_fixed_shape(tmp_path, mock_keras_model):
         assert onnx_path.exists()
 
 
+def _fake_tf2onnx(from_keras):
+    """A stand-in tf2onnx module, so these tests run even where the real toolchain cannot import."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(convert=SimpleNamespace(from_keras=from_keras))
+
+
+def test_concurrent_onnx_exports_never_serve_a_partial_file(tmp_path, mock_keras_model):
+    """A second ONNX request for one job must not truncate the file the first one returned."""
+    import itertools
+    import sys
+
+    job_id = str(uuid4())
+    export_dir = tmp_path / "exports" / job_id
+    export_dir.mkdir(parents=True)
+    (export_dir / "model.keras").write_text("dummy")
+    onnx_bytes = b"onnx model bytes" * 1024
+
+    # Both requests get past the "already exported" check before either one writes, the
+    # way two requests handled in parallel by the download endpoint's threadpool do. The
+    # second conversion only finishes after the first request has returned its path.
+    both_converting = threading.Barrier(2)
+    first_done = threading.Event()
+    second_writing = threading.Event()
+    served_read = threading.Event()
+    call_numbers = itertools.count(1)
+
+    def from_keras(model, input_signature):
+        call_number = next(call_numbers)
+        with contextlib.suppress(threading.BrokenBarrierError):
+            both_converting.wait(timeout=1)
+        onnx_model = Mock()
+        if call_number == 1:
+            onnx_model.SerializeToString.return_value = onnx_bytes
+        else:
+            first_done.wait(timeout=5)
+
+            def serialize():
+                second_writing.set()
+                served_read.wait(timeout=5)
+                return onnx_bytes
+
+            onnx_model.SerializeToString.side_effect = serialize
+        return onnx_model, None
+
+    results, errors = [], []
+
+    def worker():
+        try:
+            results.append(export_onnx(job_id, "test_model"))
+            first_done.set()
+        except Exception as e:  # noqa: BLE001 - the test inspects whatever was raised
+            errors.append(e)
+
+    with (
+        patch("app.services.model_export.EXPORTS_BASE", tmp_path / "exports"),
+        patch("tensorflow.keras.models.load_model", return_value=mock_keras_model),
+        patch.dict(sys.modules, {"tf2onnx": _fake_tf2onnx(from_keras)}),
+    ):
+        threads = [threading.Thread(target=worker) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        first_done.wait(timeout=5)
+        second_writing.wait(timeout=2)
+        # The first request's response is being served from this path right now.
+        served = results[0].read_bytes()
+        served_read.set()
+        for thread in threads:
+            thread.join()
+
+    assert errors == []
+    assert served == onnx_bytes
+    assert results[0].read_bytes() == onnx_bytes
+    assert {p.name for p in export_dir.iterdir()} == {"model.keras", "test_model.onnx"}
+
+
+def test_failed_onnx_write_leaves_no_partial_file(tmp_path, mock_keras_model):
+    """A failed ONNX write must not leave a file that later requests serve as the export."""
+    import sys
+
+    job_id = str(uuid4())
+    export_dir = tmp_path / "exports" / job_id
+    export_dir.mkdir(parents=True)
+    (export_dir / "model.keras").write_text("dummy")
+
+    # protobuf refuses to serialize messages over 2 GB, so a very large model fails here.
+    too_large = Mock()
+    too_large.SerializeToString.side_effect = ValueError("Message onnx.ModelProto exceeds maximum protobuf size of 2GB")
+
+    with (
+        patch("app.services.model_export.EXPORTS_BASE", tmp_path / "exports"),
+        patch("tensorflow.keras.models.load_model", return_value=mock_keras_model),
+        patch.dict(sys.modules, {"tf2onnx": _fake_tf2onnx(Mock(return_value=(too_large, None)))}),
+        pytest.raises(ValueError),
+    ):
+        export_onnx(job_id, "test_model")
+
+    assert {p.name for p in export_dir.iterdir()} == {"model.keras"}
+
+
 def test_get_export_formats_structure(tmp_path):
     """get_export_formats returns correct structure."""
     job_id = str(uuid4())
@@ -593,11 +706,6 @@ def test_path_traversal_prevention(tmp_path, mock_keras_model):
         patch("tensorflow.keras.models.load_model", return_value=mock_keras_model),
         patch("tensorflow.keras.models.save_model"),
     ):
-        # Create savedmodel directory for zipping
-        savedmodel_dir = export_dir / "savedmodel"
-        savedmodel_dir.mkdir()
-        (savedmodel_dir / "saved_model.pb").write_text("dummy pb")
-
         zip_path = export_savedmodel(job_id, malicious_name)
 
         # Verify the file is created inside the export_dir, not outside
@@ -645,31 +753,32 @@ def test_concurrent_export_requests(tmp_path, mock_keras_model):
 
     def export_worker():
         try:
-            # Mock TFLite converter
-            mock_converter = Mock()
-            mock_converter.convert.return_value = b"tflite model bytes"
-
-            import tensorflow as tf
-
-            with (
-                patch("app.services.model_export.EXPORTS_BASE", tmp_path / "exports"),
-                patch.object(tf.keras.models, "load_model", return_value=mock_keras_model),
-                patch.object(tf.lite.TFLiteConverter, "from_saved_model", return_value=mock_converter),
-            ):
-                result = export_tflite(job_id, model_name)
-                results.append(result)
+            results.append(export_tflite(job_id, model_name))
         except Exception as e:
             errors.append(e)
 
-    # Start two threads simultaneously
-    thread1 = threading.Thread(target=export_worker)
-    thread2 = threading.Thread(target=export_worker)
+    # Mock TFLite converter
+    mock_converter = Mock()
+    mock_converter.convert.return_value = b"tflite model bytes"
 
-    thread1.start()
-    thread2.start()
+    import tensorflow as tf
 
-    thread1.join()
-    thread2.join()
+    # Patch once on the main thread: patching inside each worker can unwind out of
+    # order and leave the mocks installed for the rest of the test session.
+    with (
+        patch("app.services.model_export.EXPORTS_BASE", tmp_path / "exports"),
+        patch.object(tf.keras.models, "load_model", return_value=mock_keras_model),
+        patch.object(tf.lite.TFLiteConverter, "from_saved_model", return_value=mock_converter),
+    ):
+        # Start two threads simultaneously
+        thread1 = threading.Thread(target=export_worker)
+        thread2 = threading.Thread(target=export_worker)
+
+        thread1.start()
+        thread2.start()
+
+        thread1.join()
+        thread2.join()
 
     # Both should succeed (no errors)
     assert len(errors) == 0
@@ -678,6 +787,122 @@ def test_concurrent_export_requests(tmp_path, mock_keras_model):
     # Both should return the same path
     assert results[0] == results[1]
     assert results[0].exists()
+    # The second request reused the first one's file instead of converting again.
+    assert mock_converter.convert.call_count == 1
+
+
+def _racing_export(barrier):
+    """Stand-in for ``Model.export`` that writes the way TensorFlow does.
+
+    TensorFlow writes checkpoint shards into ``variables/variables_temp/``, then
+    MergeV2Checkpoints merges them into ``variables/`` and deletes the temp
+    directory. The barrier holds every caller between those two steps, so callers
+    sharing one directory deterministically reproduce the race reported in #425:
+    whoever merges second finds the temp directory already gone. Exports that do
+    not overlap (because they were serialized) give up waiting and carry on.
+    """
+
+    def export(path):
+        temp_dir = Path(path) / "variables" / "variables_temp"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        (temp_dir / "part-00000-of-00001").write_bytes(b"checkpoint shard")
+        with contextlib.suppress(threading.BrokenBarrierError):
+            barrier.wait(timeout=2)
+        merged = b"".join(shard.read_bytes() for shard in sorted(temp_dir.iterdir()))
+        (temp_dir.parent / "variables.data-00000-of-00001").write_bytes(merged)
+        shutil.rmtree(temp_dir)
+        (Path(path) / "saved_model.pb").write_bytes(b"graph")
+
+    return export
+
+
+def _run_concurrently(*calls):
+    """Run each zero-argument callable in its own thread; return (results, errors)."""
+    results, errors = [], []
+
+    def worker(call):
+        try:
+            results.append(call())
+        except Exception as e:  # noqa: BLE001 - the test inspects whatever was raised
+            errors.append(e)
+
+    threads = [threading.Thread(target=worker, args=(call,)) for call in calls]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    return results, errors
+
+
+@pytest.mark.parametrize(
+    "formats",
+    [("savedmodel", "tflite"), ("savedmodel", "savedmodel"), ("tflite", "tflite")],
+    ids=["savedmodel+tflite", "savedmodel+savedmodel", "tflite+tflite"],
+)
+def test_concurrent_exports_for_one_job_do_not_collide(tmp_path, formats):
+    """Concurrent exports of one job don't share a SavedModel directory (#425).
+
+    Different formats export in parallel, each in its own directory; a second
+    request for the same format reuses the first one's file.
+    """
+    import tensorflow as tf
+
+    job_id = str(uuid4())
+    model_name = "test_model"
+    export_dir = tmp_path / "exports" / job_id
+    export_dir.mkdir(parents=True)
+    (export_dir / "model.keras").write_text("dummy")
+
+    model = Mock()
+    model.export.side_effect = _racing_export(threading.Barrier(len(set(formats))))
+    converter = Mock()
+    converter.convert.return_value = b"tflite model bytes"
+    exporters = {"savedmodel": export_savedmodel, "tflite": export_tflite}
+
+    with (
+        patch("app.services.model_export.EXPORTS_BASE", tmp_path / "exports"),
+        patch.object(tf.keras.models, "load_model", return_value=model),
+        patch.object(tf.lite.TFLiteConverter, "from_saved_model", return_value=converter),
+    ):
+        results, errors = _run_concurrently(*(lambda f=f: exporters[f](job_id, model_name) for f in formats))
+
+    assert errors == []
+    assert len(results) == len(formats)
+    assert model.export.call_count == len(set(formats))
+    for path in results:
+        if path.suffix == ".zip":
+            with zipfile.ZipFile(path) as archive:
+                assert archive.testzip() is None
+                assert "savedmodel/saved_model.pb" in {n.replace("\\", "/") for n in archive.namelist()}
+        else:
+            assert path.read_bytes() == b"tflite model bytes"
+    # Scratch directories are removed once each export is published.
+    assert {p.name for p in export_dir.iterdir()} == {"model.keras"} | {p.name for p in results}
+
+
+@pytest.mark.slow
+def test_concurrent_real_savedmodel_and_tflite_exports(tmp_path):
+    """The reproduction from #425 with a real model: SavedModel and TFLite at once."""
+    import tensorflow as tf
+
+    job_id = str(uuid4())
+    model_name = "real_model"
+    export_dir = tmp_path / "exports" / job_id
+    export_dir.mkdir(parents=True)
+    model = tf.keras.Sequential([tf.keras.layers.Input((4,)), tf.keras.layers.Dense(2)])
+    model.save(export_dir / "model.keras")
+
+    with patch("app.services.model_export.EXPORTS_BASE", tmp_path / "exports"):
+        results, errors = _run_concurrently(
+            lambda: export_savedmodel(job_id, model_name),
+            lambda: export_tflite(job_id, model_name),
+        )
+
+    assert errors == []
+    zip_path, tflite_path = sorted(results, key=lambda p: p.suffix != ".zip")
+    with zipfile.ZipFile(zip_path) as archive:
+        assert any(name.endswith("saved_model.pb") for name in archive.namelist())
+    tf.lite.Interpreter(model_content=tflite_path.read_bytes()).allocate_tensors()
 
 
 def test_storage_limit_triggers_cleanup(tmp_path, db_session: Session):
@@ -787,3 +1012,189 @@ def test_expires_at_in_formats_response(tmp_path):
         # Allow 1 second tolerance for file system time precision
         time_diff = abs((expires_at - expected_expires).total_seconds())
         assert time_diff < 1, f"Expected {expected_expires}, got {expires_at}"
+
+
+def test_export_endpoints_reject_non_completed_job_status(client: TestClient, db_session: Session):
+    """Both /formats and download endpoints return 400 when training is not completed."""
+    model = ModelBasic(id=10, model_name="status_test_model", graph_ir={})
+    db_session.add(model)
+    db_session.commit()
+
+    non_completed_statuses = [
+        TrainingStatus.PENDING,
+        TrainingStatus.RUNNING,
+        TrainingStatus.FAILED,
+        TrainingStatus.CANCELLED,
+    ]
+
+    for status in non_completed_statuses:
+        job = TrainingJob(
+            id=str(uuid4()),
+            model_id=model.id,
+            status=status,
+            hyperparams={},
+        )
+        db_session.add(job)
+        db_session.commit()
+
+        # Check /formats endpoint
+        formats_resp = client.get(f"/api/v1/model/export/{job.id}/formats")
+        assert formats_resp.status_code == 400
+        assert f"Current status: {status.value}" in formats_resp.json()["detail"]
+        assert "Export only available for completed training jobs" in formats_resp.json()["detail"]
+
+        # Check download endpoint
+        download_resp = client.get(f"/api/v1/model/export/{job.id}?format=savedmodel")
+        assert download_resp.status_code == 400
+        assert f"Current status: {status.value}" in download_resp.json()["detail"]
+        assert "Export only available for completed training jobs" in download_resp.json()["detail"]
+
+
+def test_export_endpoints_return_404_when_job_not_found(client: TestClient):
+    """Endpoints return 404 when requested job_id does not exist."""
+    missing_job_id = str(uuid4())
+
+    formats_resp = client.get(f"/api/v1/model/export/{missing_job_id}/formats")
+    assert formats_resp.status_code == 404
+    assert formats_resp.json()["detail"] == "Training job not found"
+
+    download_resp = client.get(f"/api/v1/model/export/{missing_job_id}?format=savedmodel")
+    assert download_resp.status_code == 404
+    assert download_resp.json()["detail"] == "Training job not found"
+
+
+def test_export_endpoints_return_404_when_model_missing(client: TestClient, db_session: Session):
+    """Endpoints return 404 when job's associated model is missing."""
+    model = ModelBasic(id=11, model_name="missing_model_test", graph_ir={})
+    db_session.add(model)
+    db_session.commit()
+
+    job = TrainingJob(
+        id=str(uuid4()),
+        model_id=model.id,
+        status=TrainingStatus.COMPLETED,
+        hyperparams={},
+    )
+    db_session.add(job)
+    db_session.commit()
+
+    with patch.object(
+        Session, "get", side_effect=lambda entity, ident, *a, **k: job if entity is TrainingJob else None
+    ):
+        formats_resp = client.get(f"/api/v1/model/export/{job.id}/formats")
+        assert formats_resp.status_code == 404
+        assert formats_resp.json()["detail"] == "Model not found"
+
+        download_resp = client.get(f"/api/v1/model/export/{job.id}?format=savedmodel")
+        assert download_resp.status_code == 404
+        assert download_resp.json()["detail"] == "Model not found"
+
+
+def test_export_endpoints_success_for_completed_job(client: TestClient, db_session: Session, tmp_path):
+    """Endpoints succeed for completed training jobs."""
+    model = ModelBasic(id=12, model_name="success_model", graph_ir={})
+    db_session.add(model)
+    db_session.commit()
+
+    job_id = str(uuid4())
+    job = TrainingJob(
+        id=job_id,
+        model_id=model.id,
+        status=TrainingStatus.COMPLETED,
+        hyperparams={},
+    )
+    db_session.add(job)
+    db_session.commit()
+
+    dummy_zip = tmp_path / "dummy.zip"
+    dummy_zip.write_bytes(b"PK\x05\x06" + b"\x00" * 18)
+
+    with (
+        patch("app.routers.export.export_savedmodel", return_value=dummy_zip),
+        patch("app.routers.export.get_export_formats", return_value={"savedmodel": {"available": True}}),
+    ):
+        formats_resp = client.get(f"/api/v1/model/export/{job_id}/formats")
+        assert formats_resp.status_code == 200
+        assert formats_resp.json() == {"formats": {"savedmodel": {"available": True}}}
+
+        download_resp = client.get(f"/api/v1/model/export/{job_id}?format=savedmodel")
+        assert download_resp.status_code == 200
+        assert download_resp.headers["content-type"] == "application/zip"
+        assert download_resp.content == b"PK\x05\x06" + b"\x00" * 18
+
+
+def test_export_download_model_file_missing_on_disk(client: TestClient, db_session: Session):
+    """Download endpoint returns 404 if model file is missing on disk for a completed job."""
+    model = ModelBasic(id=13, model_name="missing_disk_model", graph_ir={})
+    db_session.add(model)
+    db_session.commit()
+
+    job_id = str(uuid4())
+    job = TrainingJob(
+        id=job_id,
+        model_id=model.id,
+        status=TrainingStatus.COMPLETED,
+        hyperparams={},
+    )
+    db_session.add(job)
+    db_session.commit()
+
+    with patch("app.routers.export.export_savedmodel", side_effect=FileNotFoundError("model.keras missing")):
+        download_resp = client.get(f"/api/v1/model/export/{job_id}?format=savedmodel")
+        assert download_resp.status_code == 404
+        assert "Model file not found" in download_resp.json()["detail"]
+
+
+def test_export_download_onnx_unsupported(client: TestClient, db_session: Session):
+    """Download endpoint returns 400 when ONNX export is unsupported."""
+    model = ModelBasic(id=14, model_name="onnx_unsupported_model", graph_ir={})
+    db_session.add(model)
+    db_session.commit()
+
+    job_id = str(uuid4())
+    job = TrainingJob(
+        id=job_id,
+        model_id=model.id,
+        status=TrainingStatus.COMPLETED,
+        hyperparams={},
+    )
+    db_session.add(job)
+    db_session.commit()
+
+    with patch(
+        "app.routers.export.export_onnx",
+        side_effect=ONNXUnsupportedError(["RNN layers with variable seq length not supported"]),
+    ):
+        download_resp = client.get(f"/api/v1/model/export/{job_id}?format=onnx")
+        assert download_resp.status_code == 400
+        data = download_resp.json()
+        assert data["detail"]["error"] == "onnx_unsupported"
+        assert "RNN layers with variable seq length not supported" in data["detail"]["issues"]
+
+
+def test_export_download_updates_timestamp(client: TestClient, db_session: Session, tmp_path):
+    """Successful download updates last_export_download_at on the training job."""
+    model = ModelBasic(id=15, model_name="timestamp_model", graph_ir={})
+    db_session.add(model)
+    db_session.commit()
+
+    job_id = str(uuid4())
+    job = TrainingJob(
+        id=job_id,
+        model_id=model.id,
+        status=TrainingStatus.COMPLETED,
+        hyperparams={},
+        last_export_download_at=None,
+    )
+    db_session.add(job)
+    db_session.commit()
+
+    dummy_zip = tmp_path / "dummy.zip"
+    dummy_zip.write_bytes(b"PK\x05\x06" + b"\x00" * 18)
+
+    with patch("app.routers.export.export_savedmodel", return_value=dummy_zip):
+        download_resp = client.get(f"/api/v1/model/export/{job_id}?format=savedmodel")
+        assert download_resp.status_code == 200
+
+    db_session.refresh(job)
+    assert job.last_export_download_at is not None

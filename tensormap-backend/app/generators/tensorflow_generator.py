@@ -20,6 +20,7 @@ from typing import Any
 from app.ir.schema import IRGraph, IRNode
 from app.ir.translator import ir_to_keras_build_args
 from app.layers.registry import LAYER_REGISTRY
+from app.shared.errors import layer_shape_mismatch_message
 from app.shared.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -132,14 +133,18 @@ class TensorFlowGenerator:
                 # Gather input tensors
                 source_tensors = [keras_tensors[src] for src in all_sources]
 
-                # Handle merge layers (Concatenate)
-                if node.node_params.layer_type == "concatenate":
+                # Handle merge layers (Concatenate, Add)
+                if node.node_params.layer_type in ("concatenate", "add"):
                     if len(source_tensors) < 2:
+                        layer_name = node.node_params.layer_type.capitalize()
                         raise TensorFlowGeneratorError(
-                            f"Concatenate node {target_id} requires at least 2 inputs, got {len(source_tensors)}"
+                            f"{layer_name} node {target_id} requires at least 2 inputs, got {len(source_tensors)}"
                         )
                     layer = self._build_layer(node)
-                    keras_tensors[target_id] = layer(source_tensors)
+                    try:
+                        keras_tensors[target_id] = layer(source_tensors)
+                    except ValueError as e:
+                        raise TensorFlowGeneratorError(f"Layer {target_id} ({node.node_params.layer_type}): {e}") from e
                 else:
                     # Single input or auto-concatenate
                     if len(source_tensors) > 1:
@@ -148,7 +153,22 @@ class TensorFlowGenerator:
                         input_tensor = source_tensors[0]
 
                     layer = self._build_layer(node)
-                    keras_tensors[target_id] = layer(input_tensor)
+                    try:
+                        keras_tensors[target_id] = layer(input_tensor)
+                    except ValueError as e:
+                        # Keras names only its own layer and ndim here; report the
+                        # two canvas nodes, the incoming shape and what to change.
+                        raise TensorFlowGeneratorError(
+                            layer_shape_mismatch_message(target_id, all_sources, input_tensor.shape, layer)
+                        ) from e
+
+        # Check for dangling input nodes that are not connected to any other layer
+        dangling_inputs = sorted(n.id for n in input_nodes if n.id not in source_to_targets)
+        if dangling_inputs:
+            raise TensorFlowGeneratorError(
+                f"Input layers are not connected to any other layer: {', '.join(dangling_inputs)}. "
+                "Connect them to the graph or remove them from the canvas."
+            )
 
         # Identify inputs and outputs
         inputs = [keras_tensors[n.id] for n in input_nodes]
@@ -158,7 +178,9 @@ class TensorFlowGenerator:
         output_node_ids = [nid for nid in nodes_by_id if nid not in source_to_targets and nid not in input_node_ids]
 
         if not output_node_ids:
-            raise TensorFlowGeneratorError("Graph has no output nodes (cycle or malformed graph)")
+            raise TensorFlowGeneratorError(
+                "Model has no output layer. Connect at least one layer downstream of an input node before training."
+            )
 
         outputs = [keras_tensors[oid] for oid in output_node_ids if oid in keras_tensors]
 
@@ -190,7 +212,10 @@ class TensorFlowGenerator:
 
         # Look up layer spec in registry
         if layer_type not in LAYER_REGISTRY:
-            raise TensorFlowGeneratorError(f"Unknown layer type: {layer_type}")
+            raise TensorFlowGeneratorError(
+                f"Unknown layer type: {layer_type} (node {node.id}). "
+                f"Supported layer types: {', '.join(sorted(LAYER_REGISTRY))}."
+            )
 
         spec = LAYER_REGISTRY[layer_type]
 

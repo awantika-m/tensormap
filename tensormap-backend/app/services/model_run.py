@@ -1,23 +1,26 @@
 import asyncio
+import contextlib
 import contextvars
 import os
+from typing import Any
 
 import pandas as pd
 import tensorflow as tf
+from sklearn.model_selection import train_test_split
 from sqlmodel import Session, select
 
 from app.callbacks import CancellationCheckCallback, MetricsCallback
 from app.config import get_settings
 from app.models.data import DataFile, ImageProperties
 from app.models.ml import ModelBasic
-from app.models.training_job import TrainingStatus
+from app.models.training_job import TrainingJob, TrainingStatus
 from app.shared.constants import (
     MODEL_GENERATION_LOCATION,
     MODEL_GENERATION_TYPE,
     SOCKETIO_DL_NAMESPACE,
     SOCKETIO_LISTENER,
 )
-from app.shared.enums import ProblemType
+from app.shared.enums import LossFunction, ProblemType
 from app.shared.logging_config import get_logger
 from app.shared.training_events import training_event
 from app.socketio_instance import sio
@@ -40,9 +43,11 @@ def _validate_training_params(batch_size, epochs, training_split):
     errors = []
     if batch_size is not None and (not isinstance(batch_size, int) or batch_size <= 0):
         errors.append(f"batch_size must be a positive integer, got {batch_size!r}")
-    if epochs is not None and (not isinstance(epochs, int) or epochs <= 0):
+    if epochs is None or not isinstance(epochs, int) or epochs <= 0:
         errors.append(f"epochs must be a positive integer, got {epochs!r}")
-    if training_split is not None:
+    if training_split is None:
+        errors.append("training_split must be specified")
+    else:
         try:
             ts = float(training_split)
         except (TypeError, ValueError):
@@ -52,6 +57,69 @@ def _validate_training_params(batch_size, epochs, training_split):
                 errors.append(f"training_split must be between 0 and 100, got {ts}")
     if errors:
         raise ValueError("Invalid training parameters: " + "; ".join(errors))
+
+
+# Keras loss classes keyed by the name stored on ModelBasic.loss.
+_LOSS_CLASSES: dict[str, type[tf.keras.losses.Loss]] = {
+    LossFunction.SPARSE_CATEGORICAL_CROSSENTROPY: tf.keras.losses.SparseCategoricalCrossentropy,
+    LossFunction.CATEGORICAL_CROSSENTROPY: tf.keras.losses.CategoricalCrossentropy,
+    LossFunction.BINARY_CROSSENTROPY: tf.keras.losses.BinaryCrossentropy,
+    LossFunction.MEAN_SQUARED_ERROR: tf.keras.losses.MeanSquaredError,
+    LossFunction.MEAN_ABSOLUTE_ERROR: tf.keras.losses.MeanAbsoluteError,
+    LossFunction.HUBER: tf.keras.losses.Huber,
+}
+# Cross-entropy losses need to know whether the output layer already applies
+# softmax/sigmoid; the regression losses take no such flag.
+_LOGIT_LOSSES = frozenset(
+    {
+        LossFunction.SPARSE_CATEGORICAL_CROSSENTROPY,
+        LossFunction.CATEGORICAL_CROSSENTROPY,
+        LossFunction.BINARY_CROSSENTROPY,
+    }
+)
+
+
+def _emits_logits(model: tf.keras.Model) -> bool:
+    """True unless the model's output layer already applies softmax or sigmoid."""
+    output_layer = model.layers[-1]
+    activation = getattr(output_layer, "activation", None)
+    name = getattr(activation, "__name__", type(output_layer).__name__).lower()
+    return name not in ("softmax", "sigmoid")
+
+
+def resolve_loss(name: str | None, from_logits: bool) -> tf.keras.losses.Loss:
+    """Build the Keras loss for a stored loss name.
+
+    Raises ValueError for names outside ``LossFunction`` instead of silently
+    compiling with mean squared error.
+    """
+    loss_cls = _LOSS_CLASSES.get(name)
+    if loss_cls is None:
+        valid = ", ".join(_LOSS_CLASSES)
+        raise ValueError(f"Unsupported loss function: {name!r}. Valid: {valid}")
+    if name in _LOGIT_LOSSES:
+        return loss_cls(from_logits=from_logits)
+    return loss_cls()
+
+
+def _build_optimizer(optimizer_name: Any, lr: float | None = None) -> Any:
+    """Build a Keras optimizer, configuring learning rate if specified.
+
+    Returns the optimizer name string or configured Keras optimizer instance.
+    """
+    if not isinstance(optimizer_name, str):
+        return optimizer_name or "adam"
+    opt_name = optimizer_name.lower()
+    if lr is not None:
+        try:
+            return tf.keras.optimizers.get({"class_name": opt_name, "config": {"learning_rate": float(lr)}})
+        except Exception:
+            opt = tf.keras.optimizers.get(opt_name)
+            if hasattr(opt, "learning_rate"):
+                with contextlib.suppress(Exception):
+                    opt.learning_rate.assign(float(lr))
+            return opt
+    return opt_name
 
 
 # Context variable holding the event loop for each concurrent training task,
@@ -217,13 +285,8 @@ def model_run(
         _training_loop_ctx.reset(token)
 
 
-def _prepare_training_data(features, target_field, training_split):
-    """Prepare training data with transparent logging of dropped rows (Issue #5).
-
-    Instead of silently dropping rows with missing values, this function logs
-    the count and emits a Socket.IO warning so the user knows their dataset
-    was trimmed before training.
-    """
+def _prepare_training_data(features, target_field, training_split, problem_type):
+    """Prepare training data with stratified splitting for classification."""
     original_rows = len(features)
     rows_with_missing = int(features.isnull().any(axis=1).sum())
 
@@ -239,17 +302,54 @@ def _prepare_training_data(features, target_field, training_split):
     if target_field not in features.columns:
         raise ValueError(f"Target field '{target_field}' not found in dataset after cleaning")
 
-    # Shuffle to prevent issues with ordered datasets
-    features = features.sample(frac=1, random_state=42).reset_index(drop=True)
+    is_classification = problem_type == ProblemType.CLASSIFICATION
+
+    if not is_classification:
+        features = features.sample(frac=1, random_state=42).reset_index(drop=True)
 
     X = features.drop(target_field, axis=1)
     y = features[target_field]
-    # Encode string labels to integers for categorical targets
+
     if not pd.api.types.is_numeric_dtype(y):
-        y = pd.Categorical(y).codes
+        y = pd.Series(pd.Categorical(y).codes, index=features.index)
+
+    if is_classification:
+        class_counts = y.value_counts()
+        train_size = int(len(X) * float(training_split) / 100)
+        test_size = len(X) - train_size
+        num_classes = len(class_counts)
+
+        if num_classes < 2 or class_counts.min() < 2 or train_size < num_classes or test_size < num_classes:
+            raise ValueError(
+                "Stratified splitting is not possible: every class needs at least "
+                "2 samples, and both training and testing partitions must contain "
+                "at least one sample from every class. Add more samples or adjust "
+                "the training split."
+            )
+
+        try:
+            x_training, x_testing, y_training, y_testing = train_test_split(
+                X,
+                y,
+                train_size=float(training_split) / 100,
+                random_state=42,
+                stratify=y,
+            )
+        except ValueError as exc:
+            raise ValueError(f"Unable to create stratified training split: {exc}") from exc
+
+        return x_training, y_training, x_testing, y_testing
 
     split_index = int(len(X) * float(training_split) / 100)
     return X[:split_index], y[:split_index], X[split_index:], y[split_index:]
+
+
+def _should_skip_evaluation(callbacks: list[tf.keras.callbacks.Callback], model: tf.keras.Model) -> bool:
+    """Return True if training was cancelled or stopped prematurely, skipping evaluation."""
+    for cb in callbacks:
+        if isinstance(cb, CancellationCheckCallback) and (getattr(cb, "cancelled", False) or cb.check_cancelled()):
+            return True
+    return bool(getattr(model, "stop_training", False))
 
 
 def _run(model_name: str, db: Session, job_id: str | None = None) -> None:
@@ -258,11 +358,21 @@ def _run(model_name: str, db: Session, job_id: str | None = None) -> None:
     if model_configs is None:
         raise ModelRunError(f"Model configuration not found: {model_name}")
 
+    # Resolve effective hyperparameters: job overrides take precedence over saved model configs
+    job = db.get(TrainingJob, job_id) if job_id else None
+    hyperparams = job.hyperparams if job and job.hyperparams else {}
+
+    batch_size = hyperparams.get("batch_size") or model_configs.batch_size
+    epochs = hyperparams.get("epochs") or model_configs.epochs
+    optimizer_name = hyperparams.get("optimizer") or model_configs.optimizer
+    lr = hyperparams.get("lr")
+    training_split = model_configs.training_split
+
     # Issue #4: validate training params early for clear error messages
     _validate_training_params(
-        batch_size=model_configs.batch_size,
-        epochs=model_configs.epochs,
-        training_split=model_configs.training_split,
+        batch_size=batch_size,
+        epochs=epochs,
+        training_split=training_split,
     )
 
     if model_configs.model_type == ProblemType.IMAGE_CLASSIFICATION:
@@ -270,7 +380,7 @@ def _run(model_name: str, db: Session, job_id: str | None = None) -> None:
         if image_properties is None:
             raise ModelRunError(f"Image properties not found for file_id={model_configs.file_id}")
         image_size = (image_properties.image_size, image_properties.image_size)
-        batch_size = image_properties.batch_size
+        effective_batch_size = batch_size or image_properties.batch_size or 32
         color_mode = image_properties.color_mode
         label_mode = image_properties.label_mode
 
@@ -280,18 +390,18 @@ def _run(model_name: str, db: Session, job_id: str | None = None) -> None:
             "batch_size: %s, color_mode: %s, label_mode: %s",
             directory,
             image_size,
-            batch_size,
+            effective_batch_size,
             color_mode,
             label_mode,
         )
-        validation_split = 1 - (model_configs.training_split / 100)
+        validation_split = 1 - (float(training_split) / 100)
         train_data = tf.keras.utils.image_dataset_from_directory(
             directory,
             validation_split=validation_split,
             subset="training",
             seed=123,
             image_size=image_size,
-            batch_size=batch_size,
+            batch_size=effective_batch_size,
             color_mode=color_mode,
             label_mode=label_mode,
         )
@@ -301,7 +411,7 @@ def _run(model_name: str, db: Session, job_id: str | None = None) -> None:
             subset="validation",
             seed=123,
             image_size=image_size,
-            batch_size=batch_size,
+            batch_size=effective_batch_size,
             color_mode=color_mode,
             label_mode=label_mode,
         )
@@ -311,22 +421,22 @@ def _run(model_name: str, db: Session, job_id: str | None = None) -> None:
 
         # Issue #5: use _prepare_training_data for transparent missing-value handling
         x_training, y_training, x_testing, y_testing = _prepare_training_data(
-            features, model_configs.target_field, model_configs.training_split
+            features,
+            model_configs.target_field,
+            training_split,
+            model_configs.model_type,
         )
 
-        batch_size = model_configs.batch_size if model_configs.batch_size is not None else 32
+        effective_batch_size = batch_size if batch_size is not None else 32
 
     with open(_helper_generate_json_model_file_location(model_name=model_name)) as f:
         json_string = f.read()
     model = tf.keras.models.model_from_json(json_string, custom_objects=None)
     model.summary()
-    if model_configs.loss == "sparse_categorical_crossentropy":
-        loss = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True)
-    else:
-        loss = tf.keras.losses.MeanSquaredError()
+    optimizer = _build_optimizer(optimizer_name, lr)
     model.compile(
-        optimizer=model_configs.optimizer,
-        loss=loss,
+        optimizer=optimizer,
+        loss=resolve_loss(model_configs.loss, from_logits=_emits_logits(model)),
         metrics=[model_configs.metric],
     )
 
@@ -334,18 +444,32 @@ def _run(model_name: str, db: Session, job_id: str | None = None) -> None:
         model.fit(
             train_data,
             validation_data=test_data,
-            epochs=model_configs.epochs,
+            epochs=epochs,
             callbacks=callbacks,
             verbose=0,
         )
-        model.evaluate(test_data, callbacks=callbacks, verbose=0)
+        if _should_skip_evaluation(callbacks, model):
+            logger.info(
+                "Training cancelled or stopped early; skipping evaluation for image model '%s' (job %s)",
+                model_name,
+                job_id,
+            )
+        else:
+            model.evaluate(test_data, callbacks=callbacks, verbose=0)
     else:
         model.fit(
             x_training,
             y_training,
-            epochs=model_configs.epochs,
-            batch_size=batch_size,
+            epochs=epochs,
+            batch_size=effective_batch_size,
             callbacks=callbacks,
             verbose=0,
         )
-        model.evaluate(x_testing, y_testing, callbacks=callbacks, verbose=0)
+        if _should_skip_evaluation(callbacks, model):
+            logger.info(
+                "Training cancelled or stopped early; skipping evaluation for model '%s' (job %s)",
+                model_name,
+                job_id,
+            )
+        else:
+            model.evaluate(x_testing, y_testing, callbacks=callbacks, verbose=0)

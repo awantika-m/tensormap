@@ -3,7 +3,7 @@
  * These types must match the backend registry schema from app/layers/registry.py
  */
 
-export type ParamType = "int" | "float" | "bool" | "enum";
+export type ParamType = "int" | "float" | "bool" | "enum" | "string";
 
 export interface ParamSpec {
   name: string;
@@ -90,6 +90,8 @@ export const TYPE_ABBREVIATIONS: Record<string, string> = {
   batchnorm: "BN",
   reshape: "RS",
   concatenate: "CT",
+  add: "AD",
+  globalmaxpool2d: "GM",
 };
 
 /**

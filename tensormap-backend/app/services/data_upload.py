@@ -44,8 +44,9 @@ def add_file_service(db: Session, file_wrapper: Any, project_id: uuid_pkg.UUID |
     if file_size > settings.max_content_length:
         return _resp(413, False, "File too large. Maximum allowed size is 200MB.")
 
-    # Generate unique filename to prevent collisions
-    original_name = file_wrapper.filename.rsplit(".", 1)[0].lower()
+    # Generate unique filename to prevent collisions. The client sends the filename, so keep
+    # only a safe base name: "../x.csv" must not be written outside the upload folder.
+    original_name = secure_filename(file_wrapper.filename.rsplit(".", 1)[0].lower()) or "file"
     original_ext = file_wrapper.filename.rsplit(".", 1)[1].lower()
     unique_id = uuid_pkg.uuid4().hex[:8]
     safe_filename = f"{original_name}_{unique_id}.{original_ext}"
@@ -219,6 +220,13 @@ def delete_one_file_by_id_service(db: Session, file_id: uuid_pkg.UUID) -> tuple:
             mb.file_id = None
             db.add(mb)
 
+        # Delete associated ImageProperties record (for ZIP datasets) so FK constraints
+        # do not block the DB delete across all database engines.
+        if file.file_type == "zip":
+            image_props = db.exec(select(ImageProperties).where(ImageProperties.id == file_id)).first()
+            if image_props:
+                db.delete(image_props)
+
         db.delete(file)
         db.commit()
     except (SQLAlchemyError, OSError):
@@ -233,6 +241,12 @@ def delete_one_file_by_id_service(db: Session, file_id: uuid_pkg.UUID) -> tuple:
     try:
         with contextlib.suppress(FileNotFoundError):
             os.remove(file_path)
+
+        # Clean up any preprocessing backup (.bak) to prevent orphaned storage leaks
+        bak_path = file_path + ".bak"
+        if os.path.isfile(bak_path):
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(bak_path)
 
         if file.file_type == "zip":
             extract_dir_name = file.disk_name.rsplit(".", 1)[0]

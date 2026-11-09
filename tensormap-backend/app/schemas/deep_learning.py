@@ -5,6 +5,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from app.shared.enums import LossFunction, Metric, Optimizer
+
 
 # --- "code" sub-models ---
 class DatasetConfig(BaseModel):
@@ -19,8 +21,8 @@ class DLModelConfig(BaseModel):
     """Training hyperparameters (optimizer, metric, epochs)."""
 
     model_name: str = Field(min_length=1)
-    optimizer: str = Field(min_length=1)
-    metric: str = Field(min_length=1)
+    optimizer: Optimizer
+    metric: Metric
     epochs: int = Field(gt=0)
 
 
@@ -102,8 +104,11 @@ class TrainingConfigRequest(BaseModel):
     target_field: str | None = None
     training_split: float = Field(gt=0, le=100)
     problem_type_id: int = Field(ge=1, le=3)
-    optimizer: str = Field(min_length=1)
-    metric: str = Field(min_length=1)
+    optimizer: Optimizer
+    metric: Metric
     epochs: int = Field(gt=0)
     batch_size: int = Field(default=32, gt=0)
+    # Optional so clients that predate the field keep working; the service
+    # falls back to the problem-type default when it is omitted.
+    loss: LossFunction | None = None
     project_id: uuid_pkg.UUID | None = None
